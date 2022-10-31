@@ -1,0 +1,29 @@
+[package]
+name = "doodba-operator"
+version = "0.1.0"
+edition = "2021"
+default-run = "controller"
+
+# See more keys and their definitions at https://doc.rust-lang.org/cargo/reference/manifest.html
+
+[dependencies]
+tokio = { version = "1.21.2", features = ["macros", "rt-multi-thread"] }
+kube = { version = "0.76.0", features = ["runtime", "derive"] }
+k8s-openapi = { version = "0.16.0", features = ["v1_25", "schemars"] }
+serde_yaml = "0.9.14"
+serde_json = "1.0.87"
+serde = { version = "1.0.147", features = ["derive"] }
+tracing = "0.1.37"
+tracing-subscriber = "0.3.16"
+thiserror = "1.0.37"
+anyhow = "1.0.66"
+futures-util = "0.3.25"
+schemars = "0.8.11"
+
+[[bin]]
+name = "controller"
+path = "src/main.rs"
+
+[[bin]]
+name = "crdgen"
+path = "src/bin/crdgen.rs"
