@@ -1,4 +1,3 @@
-use stackable_operator::error::Error as StackableOperatorError;
 use thiserror::Error;
 
 #[derive(Error, Debug)]
@@ -6,9 +5,24 @@ pub enum Error {
     #[error("IO Error: {0}")]
     Io(#[from] std::io::Error),
 
-    #[error("Stackable Operator Error: {0}")]
-    StackableOperator(#[from] StackableOperatorError), // FIXME - we dont want this really
+    #[error("Failed to serialize YAML: {source}")]
+    YamlSerializationError {
+        #[from]
+        source: serde_yaml::Error,
+    },
 
-    #[error("No Before Create is configured")]
-    NoBeforeCreate,
+    #[error("Kubernetes reported error: {source}")]
+    KubeError {
+        #[from]
+        source: kube::Error,
+    },
+
+    #[error("Finalizer Error: {0}")]
+    FinalizerError(#[source] kube::runtime::finalizer::Error<kube::Error>),
+
+    #[error("Kubernetes failed to delete object: {source}")]
+    KubeDeleteError {
+        #[from]
+        source: kube::runtime::wait::delete::Error,
+    },
 }
