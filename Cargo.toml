@@ -6,16 +6,18 @@ edition = "2021"
 # See more keys and their definitions at https://doc.rust-lang.org/cargo/reference/manifest.html
 
 [dependencies]
-tokio = { version = "1.21.2", features = ["macros", "rt-multi-thread"] }
-serde_yaml = "0.9.14"
-serde_json = "1.0.87"
-serde = { version = "1.0.147", features = ["derive"] }
-tracing = "0.1.37"
-tracing-subscriber = "0.3.16"
-thiserror = "1.0.37"
-anyhow = "1.0.66"
-futures-util = "0.3.25"
-schemars = "0.8.11"
-clap = { version = "4.0.18", features = ["derive"]}
-kube = { version = "0.76.0", features = ["runtime", "derive"] }
-k8s-openapi = { version = "0.16.0", features = ["v1_25", "schemars"] }
+tokio = { version = "1.29", features = ["macros", "rt-multi-thread"] }
+serde_yaml = "0.9"
+serde_json = "1"
+serde = { version = "1", features = ["derive"] }
+tracing = "0.1"
+tracing-subscriber = "0.3"
+thiserror = "1"
+anyhow = "1"
+futures-util = "0.3"
+schemars = "0.8"
+clap = { version = "4.3.15", features = ["derive"]}
+kube = { version = "0.84.0", features = ["runtime", "derive"] }
+k8s-openapi = { version = "0.18.0", features = ["v1_26"] }
+futures = "0.3"
+if_chain = "1.0.2"

@@ -1,32 +1,25 @@
-pub mod annotations;
-pub mod config;
-pub mod database;
-pub mod filestore;
-pub mod instance;
 pub mod phase;
 
-use std::{sync::Arc, time::Duration};
+use std::{collections::BTreeMap, sync::Arc};
+
+use kube::{
+    api::{Api, ListParams, Patch, PatchParams, PostParams},
+    core::ObjectMeta,
+    runtime::controller::Action,
+    CustomResource, Resource, ResourceExt,
+};
 
 use k8s_openapi::api::{
-    apps::v1::Deployment,
-    batch::v1::Job,
-    core::v1::{
-        ConfigMap, Container, EnvVar, PersistentVolumeClaim, Secret, Service, Volume, VolumeMount,
-    },
-    networking::v1::Ingress,
-};
-use kube::{
-    api::{Api, Patch, PatchParams, ResourceExt},
-    runtime::controller::Action,
-    CustomResource,
+    batch::v1::{Job, JobSpec},
+    core::v1::{Container, PodSpec, PodTemplateSpec},
 };
 
 use schemars::JsonSchema;
 
+use crate::controller::Context;
 use serde::{Deserialize, Serialize};
-use serde_json::json;
 
-use crate::{error::Error, reconcile::Data};
+use self::phase::DoodbaPhase;
 
 pub static FINALIZER: &str = "doodba.glo.systems";
 
@@ -37,26 +30,21 @@ pub struct DoodbaStatus {
     #[serde(default)]
     pub phase: phase::DoodbaPhase,
 
-    // Not using the standard conditions here by design, for now:
-    // see https://github.com/kube-rs/kube/issues/43
-    // waiting to see how https://github.com/kube-rs/kube/issues/427 shakes out
-    /// do we need to run before_create?
-    pub needs_create: bool,
+    #[serde(default)]
+    pub last_applied_image: Option<String>,
 
-    // do we need to wait for a before_update?
-    pub needs_update: bool,
-
-    // are we ready to run?
-    pub ready: bool,
+    /// Current state
+    #[serde(default)]
+    pub initialised: bool,
 }
 
 /// OdooSpec defines the desired state of Odoo
 #[derive(CustomResource, Clone, Debug, Deserialize, Serialize, JsonSchema)]
 #[kube(
     group = "doodba.glo.systems",
-    version = "v1",
+    version = "v1alpha1",
     kind = "Doodba",
-    plural = "doodbas",
+    plural = "doodba",
     shortname = "Doodba",
     namespaced
 )]
@@ -69,271 +57,240 @@ pub struct DoodbaSpec {
     /// The docker tag for the image
     pub tag: String,
 
-    /// The image pull policy
-    pub image_pull_policy: Option<String>,
-
-    /// The database credentials
-    pub database: database::Database,
-
-    /// The filestore storage
-    pub filestore: filestore::FileStore,
-
-    /// Extra volumes
-    pub extra_volumes: Option<Volume>,
-
-    /// Extra volume mounts
-    pub extra_volume_mounts: Option<VolumeMount>,
-
-    /// Extra environment variables
-    #[serde(default)]
-    pub extra_env: Vec<EnvVar>,
-
-    /// Configuration
-    pub config: Option<config::OdooConfig>,
-
     /// Suspend reconciliation
     #[serde(default)]
     pub suspend: bool,
+    // bootstrap: options to bootstrap
+    //  enabled: bool
+    //  // FIXME: this should be safe, this isn't, it will trash dbs
+    //  command: "odoo -i base --stop-after-init --no-http"
+    // upgrade: options to upgrade
+    //  command: "click-odoo-upgrade"
 
-    /// The deployments to run/execute
-    pub instances: Vec<instance::Instance>,
+    // postgres: how to configure
+    // postgres:
+    //  host: "string"
+    //  port: "string"
+    //  username: from secret ref
+    //  password: from secret ref
 
-    /// Run a command as a job before create (i.e. init a database using click-odoo)
-    pub before_create: Option<String>,
+    // filestore pvc
 
-    /// Run a command as a job before update (i.e. upgrade a database using click-odoo)
-    pub before_update: Option<String>,
+    // volumes: list of extra volumes
+    // volumeMounts: list of extra volumeMounts
+    // env: list of extra Envs
+
+    // web configuration
+    // web:
+    //  replica_count: 1
+    //  volumes: []
+    //  volumeMounts: []
+    //  env: []
+    //  // FIXME: Can we automate this somehow?
+    //  websocket: true
+    //  longpolling: true
+    //  // list of domains?
+    //  ingress: []
+    //
+    // queue configuration
+    // queue:
+    //  replica_count: 1
+    //  volumes: []
+    //  volumeMounts: []
+    //  env: []
+
+    // TODO how do we configure different instances without much effort?
+    // ie. we need to be be able to point QUEUE_JOB at different postgreSQL endpoints.
+    // TODO how do we configure the differences between 16.0 and prior (i.e. /websocket vs
+    // /longpolling/poll)?
+}
+
+impl DoodbaSpec {
+    pub fn full_image_name(&self) -> String {
+        format!("{}:{}", self.image, self.tag)
+    }
 }
 
 impl Doodba {
-    async fn patch_status(
-        &self,
-        api: Api<Doodba>,
-        status: DoodbaStatus,
-    ) -> Result<(), kube::Error> {
-        let new_status = Patch::Apply(json!({
-            "apiVersion": "doodba.glo.systems/v1",
-            "kind": "Doodba",
-            "status": status,
-        }));
-        let ps = PatchParams::apply("cntrlr").force();
-        let name = self.name_any();
-        api.patch_status(&name, &ps, &new_status).await?;
-
-        Ok(())
-    }
-
-    async fn set_default_status(&self, api: Api<Doodba>) -> Result<(), kube::Error> {
-        self.patch_status(
-            api,
-            DoodbaStatus {
-                needs_create: self.spec.before_create.is_some(),
-                needs_update: false,
-                ready: self.spec.before_create.is_none(),
-                ..Default::default()
-            },
-        )
-        .await?;
-
-        Ok(())
-    }
-
-    pub async fn reconcile(&self, ctx: Arc<Data>) -> Result<Action, kube::Error> {
+    pub async fn reconcile(&self, ctx: Arc<Context>) -> Result<Action, kube::Error> {
         let client = ctx.client.clone();
         let ns = self.namespace().unwrap();
-        let api: Api<Doodba> = Api::namespaced(client, &ns);
+        let docs: Api<Doodba> = Api::namespaced(client, &ns);
 
-        if self.status.is_none() {
-            self.set_default_status(api).await?;
-            return Ok(Action::requeue(Duration::from_secs(1)));
-        }
+        let mut status = self.status.clone().unwrap_or_default();
 
-        let status = self.status.as_ref().unwrap();
-
+        // are we suspended?
         if self.spec.suspend {
-            let mut status = status.clone();
-            status.phase = phase::DoodbaPhase::Suspended;
-            status.ready = false;
+            status.phase = DoodbaPhase::Suspended;
+            self.patch_status(&docs, status).await?;
 
-            self.patch_status(api, status).await?;
             return Ok(Action::await_change());
         }
 
-        // create dependant objects
-
-        if status.needs_create {
-            // check if there are any active deployments? if yes, bail out and set the error
-            // phase/state
-            //
-            // check if job exists
-            // if not create it
-            // if yes, is it finished successfully?
-            // change needs_create = false and ready = true
+        // should we run the init container?
+        if !status.initialised {
+            return self.reconcile_initialization(docs, ctx.clone()).await;
         }
 
-        if status.needs_update {
-            // upgrade
-            // scale down any active deployments
-            // check if job exists
-            // if not create it
-            // if yes, is it finished successfully?
-            // change needs_update = false and ready = true
+        // if image != current image upgrade
+        let should_upgrade = if_chain::if_chain! {
+            if let Some(image) = status.last_applied_image;
+            if image != self.spec.full_image_name();
+            then {
+                true
+            } else {
+                false
+            }
+        };
+
+        if should_upgrade {
+            todo!()
+            // scale down web worker
+            // scale down job queue
+            // scale down long polling
+            // execute upgrade
         }
 
-        // check if requested image != current image
-        //  if yes set phase to upgrading. requeue.
-
-        // check if any secrets, etc. changed and rollout restart if replica count = current
-        // update any active deployments to the relevant replica count
+        // scale everything up
+        self.reconcile_secrets(ctx.clone()).await?;
+        self.reconcile_configmaps(ctx.clone()).await?;
+        self.reconcile_services(ctx.clone()).await?;
+        self.reconcile_deployments(1, ctx.clone()).await?;
+        self.reconcile_ingresses(ctx.clone()).await?;
 
         // no events, check every 5 minutes
-        Ok(Action::requeue(Duration::from_secs(5 * 60)))
+        // Ok(Action::requeue(Duration::from_secs(5 * 60)))
+        Ok(Action::await_change())
     }
 
-    pub async fn cleanup(&self, _ctx: Arc<Data>) -> Result<Action, kube::Error> {
+    pub async fn cleanup(&self, _ctx: Arc<Context>) -> Result<Action, kube::Error> {
         // todo add some deletion event logging, db clean up, etc.?
         Ok(Action::await_change())
     }
 
-    #[allow(unused)]
-    fn before_create_job_name(&self) -> String {
-        format!("{}-before-create", self.name_unchecked())
+    async fn patch_status(
+        &self,
+        doc: &Api<Doodba>,
+        status: DoodbaStatus,
+    ) -> Result<(), kube::Error> {
+        let patch = serde_json::json!({
+            "apiVersion": "doodba.glo.systems/v1alpha1",
+            "kind": "Doodba",
+            "status": status,
+        });
+
+        let ps = PatchParams::apply("cntrlr").force();
+        let patch_status = Patch::Apply(patch);
+        doc.patch_status(&self.name_any(), &ps, &patch_status)
+            .await?;
+        Ok(())
     }
 
-    #[allow(unused)]
-    fn before_update_job_name(&self) -> String {
-        format!("{}-before-update", self.name_unchecked())
+    async fn reconcile_initialization(
+        &self,
+        docs: Api<Doodba>,
+        ctx: Arc<Context>,
+    ) -> Result<Action, kube::Error> {
+        // check if init container exists
+        let ns = self.namespace().unwrap();
+        let job = self.build_initialization_job();
+        let job_name = job.metadata.name.clone().unwrap();
+
+        let mut status = self.status.clone().unwrap_or_default();
+
+        let jobs: Api<Job> = Api::namespaced(ctx.client.clone(), &ns);
+        match jobs.get(&job_name).await {
+            Ok(job) => {
+                let job_status = job.status.unwrap_or_default();
+
+                if !(job_status.succeeded.unwrap_or_default() > 0
+                    && job_status.active.unwrap_or_default() == 0)
+                {
+                    // wait for the jobs to finish and succeed
+                    // owner_references will handle this for us.
+                    return Ok(Action::await_change());
+                }
+
+                // set complete and move on
+                status.initialised = true;
+                status.phase = DoodbaPhase::Ready;
+                self.patch_status(&docs, status.clone()).await?;
+                // TODO: Should this be a retry in X seconds?
+                return Ok(Action::await_change());
+            }
+            Err(_) => {
+                // doesn't exist, create it
+                jobs.create(&PostParams::default(), &job).await?;
+
+                status.initialised = false;
+                status.phase = DoodbaPhase::Initializing;
+                self.patch_status(&docs, status.clone()).await?;
+
+                // owner_references will trigger for us later.
+                return Ok(Action::await_change());
+            }
+        }
     }
 
-    #[allow(unused)]
-    fn configmap_name(&self) -> String {
-        format!("{}-config", self.name_unchecked())
+    fn build_initialization_job(&self) -> Job {
+        let ns = self.namespace().unwrap();
+        let name = self.name_any();
+        let oref = self.controller_owner_ref(&()).unwrap();
+        let job_name = format!("{}-init", self.name_any());
+
+        let mut labels: BTreeMap<String, String> = BTreeMap::new();
+        labels.insert("app".to_owned(), "doodba".to_string());
+        labels.insert("doodba.glo.systems/name".to_owned(), name.to_owned());
+        labels.insert("init".to_owned(), name.to_owned());
+
+        Job {
+            metadata: ObjectMeta {
+                name: Some(job_name),
+                namespace: Some(ns),
+                labels: Some(labels.clone()),
+                owner_references: Some(vec![oref]),
+                ..Default::default()
+            },
+            spec: Some(JobSpec {
+                template: PodTemplateSpec {
+                    spec: Some(PodSpec {
+                        containers: vec![Container {
+                            name: "init".to_string(),
+                            image: Some("hello-world:latest".to_string()),
+                            ..Container::default()
+                        }],
+                        restart_policy: Some("OnFailure".to_string()),
+                        ..PodSpec::default()
+                    }),
+                    ..PodTemplateSpec::default()
+                },
+                ..JobSpec::default()
+            }),
+            ..Default::default()
+        }
     }
 
-    #[allow(unused)]
-    fn secret_name(&self) -> String {
-        format!("{}-secret", self.name_unchecked())
-    }
-
-    #[allow(unused)]
-    fn build_before_create_job(&self) -> Result<Job, Error> {
-        todo!()
-
-        // if let Some(before_create) = &self.spec.before_create {
-        //     let job_meta = ObjectMetaBuilder::new()
-        //         .name(self.before_create_job_name())
-        //         .namespace_opt(self.namespace())
-        //         .ownerreference_from_resource(self, None, Some(true))?
-        //         .build();
-        //
-        //     let container = self
-        //         .container_builder("init")?
-        //         .command(vec!["/bin/bash".into()])
-        //         .args(vec![
-        //             "-c".into(),
-        //             format!(
-        //                 r#"
-        //             /opt/odoo/common/entrypoint
-        //             {}
-        //             "#,
-        //                 before_create
-        //             )
-        //             .into(),
-        //         ])
-        //         .build();
-        //
-        //     let pod = PodTemplateSpec {
-        //         metadata: Some(
-        //             ObjectMetaBuilder::new()
-        //                 .name(self.before_create_job_name())
-        //                 .build(),
-        //         ),
-        //         spec: Some(PodSpec {
-        //             containers: vec![container],
-        //             restart_policy: Some("Never".to_string()),
-        //             ..Default::default()
-        //         }),
-        //     };
-        //
-        //     let job = Job {
-        //         metadata: job_meta,
-        //         spec: Some(JobSpec {
-        //             template: pod,
-        //             ..Default::default()
-        //         }),
-        //         status: None,
-        //     };
-        //
-        //     return Ok(job);
-        // }
-        //
-        // Err(Error::NoBeforeCreate)
-    }
-
-    #[allow(unused)]
-    fn build_before_update_job(&self) -> Option<Job> {
-        todo!()
-    }
-
-    #[allow(unused)]
-    fn build_persistentvolumeclaims(&self) -> Vec<PersistentVolumeClaim> {
-        todo!()
-    }
-
-    #[allow(unused)]
-    fn build_secrets(&self) -> Vec<Secret> {
-        todo!()
-    }
-
-    #[allow(unused)]
-    fn build_configmaps(&self) -> Vec<ConfigMap> {
-        todo!()
-    }
-
-    #[allow(unused)]
-    fn build_deployments(&self) -> Vec<Deployment> {
-        todo!()
-    }
-
-    #[allow(unused)]
-    fn build_services(&self) -> Vec<Service> {
-        todo!()
-    }
-
-    #[allow(unused)]
-    fn build_ingress(&self) -> Vec<Ingress> {
+    async fn reconcile_secrets(&self, ctx: Arc<Context>) -> Result<(), kube::Error> {
         todo!()
     }
 
-    #[allow(unused)]
-    fn container_builder(&self, name: &str) -> Container {
+    async fn reconcile_configmaps(&self, ctx: Arc<Context>) -> Result<(), kube::Error> {
         todo!()
+    }
 
-        // let configmap = &self.configmap_name();
-        // let secret = &self.secret_name();
-        //
-        // let mut env_vars = vec![
-        //     env_var_from_config("PGHOST", configmap, "PGHOST"),
-        //     env_var_from_config("PGPORT", configmap, "PGPORT"),
-        //     env_var_from_config("PGUSER", configmap, "PGUSER"),
-        //     env_var_from_config("PGDATABASE", configmap, "PGDATABASE"),
-        //     env_var_from_config("PROXY_MODE", configmap, "PROXY_MODE"),
-        //     env_var_from_config("WITHOUT_DEMO", configmap, "WITHOUT_DEMO"),
-        //     env_var_from_config("SMTP_SERVER", configmap, "SMTP_SERVER"),
-        //     env_var_from_config("SMTP_PORT", configmap, "SMTP_PORT"),
-        //     env_var_from_config("SMTP_USER", configmap, "SMTP_USER"),
-        //     env_var_from_config("SMTP_SSL", configmap, "SMTP_SSL"),
-        //     env_var_from_config("LIST_DB", configmap, "LIST_DB"),
-        //     env_var_from_secret("PGPASSWORD", secret, "PGPASSWORD"),
-        //     env_var_from_secret("ADMIN_PASSWORD", secret, "ADMIN_PASSWORD"),
-        //     env_var_from_secret("SMTP_PASSWORD", secret, "SMTP_PASSWORD"),
-        // ];
-        //
-        // let builder = ContainerBuilder::new(name)?
-        //     .image(format!("{}:{}", self.spec.image, self.spec.tag,))
-        //     .image_pull_policy(self.spec.image_pull_policy.unwrap_or("IfNotPresent".into()))
-        //     .add_env_vars(env_vars);
-        //
-        // Ok(builder) // FIXME drop the clone
+    async fn reconcile_deployments(
+        &self,
+        replicas: usize,
+        ctx: Arc<Context>,
+    ) -> Result<(), kube::Error> {
+        todo!()
+    }
+
+    async fn reconcile_services(&self, ctx: Arc<Context>) -> Result<(), kube::Error> {
+        todo!()
+    }
+
+    async fn reconcile_ingresses(&self, ctx: Arc<Context>) -> Result<(), kube::Error> {
+        todo!()
     }
 }
