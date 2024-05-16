@@ -2,7 +2,9 @@
 
 :warning: A WIP operator to help run [Doodba](https://github.com/Tecnativa/doodba) based Odoo installations on Kubernetes.
 
-**Right now this is 100% non-functional**
+**Right now this is 100% non-functional and is an experiment that I'll pick up between other things**
+
+## Plan/justification for existence
 
 Managing Odoo through helm works absolutely fine... until you introduce a high
 throughput system, or the job queue.
